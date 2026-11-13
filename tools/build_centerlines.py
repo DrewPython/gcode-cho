@@ -450,10 +450,26 @@ def _close_gaps(paths, d: float, min_collinear: float):
                 anti = -(ua[0] * ub[0] + ua[1] * ub[1])
                 if anti < min_collinear:
                     continue
-                hit = _ray_intersection(pa, ua, pb, ub)
-                if hit is None:
-                    continue
-                t, s, point = hit
+                offset = (pb[0] - pa[0], pb[1] - pa[1])
+                straight = (
+                    anti >= math.cos(math.radians(COLLINEAR_DEG))
+                    and abs(ua[0] * offset[1] - ua[1] * offset[0]) <= MERGE_TOL * d
+                )
+                if straight:
+                    # Концы лежат на одной прямой: направления параллельны и
+                    # точки пересечения не существует. Вершина в этом случае
+                    # находится между концами, поэтому зазор закрывается
+                    # посередине. Без этой ветки штрих, разорванный строго
+                    # вертикально или горизонтально, не сшивался никогда:
+                    # _ray_intersection возвращал None при нулевом определителе.
+                    half = 0.5 * math.dist(pa, pb)
+                    t, s = half, half
+                    point = (pa[0] + 0.5 * offset[0], pa[1] + 0.5 * offset[1])
+                else:
+                    hit = _ray_intersection(pa, ua, pb, ub)
+                    if hit is None:
+                        continue
+                    t, s, point = hit
                 if not (1e-9 < t <= limit and 1e-9 <= s <= limit):
                     continue
                 cost = t + s + (1.0 - anti) * d
