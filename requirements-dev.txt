@@ -1,4 +1,2 @@
 fonttools>=4.50
-pillow>=10.0
-scikit-image>=0.22
-numpy>=1.26
+pillow>=10.0  # только для tools/build_centerlines.py --check

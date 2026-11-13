@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 import tempfile
 import threading
@@ -49,6 +50,56 @@ CYRILLIC = "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
 DIGITS = "0123456789"
 
 
+def _point_segment_distance(point, a, b) -> float:
+    """Расстояние от точки до отрезка a—b."""
+    px, py = point
+    ax, ay = a
+    bx, by = b
+    dx = bx - ax
+    dy = by - ay
+    length2 = dx * dx + dy * dy
+    if length2 <= 1e-18:
+        return math.dist(point, a)
+    t = ((px - ax) * dx + (py - ay) * dy) / length2
+    t = min(1.0, max(0.0, t))
+    return math.hypot(px - (ax + dx * t), py - (ay + dy * t))
+
+
+def _stroke_distance(first, second) -> float:
+    """Наименьшее расстояние между двумя ломаными."""
+    best = math.inf
+    for point in first:
+        for i in range(len(second) - 1):
+            best = min(best, _point_segment_distance(point, second[i], second[i + 1]))
+    for point in second:
+        for i in range(len(first) - 1):
+            best = min(best, _point_segment_distance(point, first[i], first[i + 1]))
+    return best
+
+
+def _strokes_connected(strokes, tol: float) -> bool:
+    """Образуют ли штрихи связную фигуру с допуском на стык."""
+    count = len(strokes)
+    if count <= 1:
+        return True
+
+    parent = list(range(count))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for i in range(count):
+        for j in range(i + 1, count):
+            if _stroke_distance(strokes[i], strokes[j]) <= tol:
+                root_i, root_j = find(i), find(j)
+                if root_i != root_j:
+                    parent[root_i] = root_j
+    return len({find(i) for i in range(count)}) == 1
+
+
 class FontTests(unittest.TestCase):
     def test_cyrillic_and_digits_exist(self) -> None:
         for key in ("A", "B"):
@@ -73,6 +124,23 @@ class FontTests(unittest.TestCase):
                 for stroke in glyph.strokes
             ]
             self.assertGreater(max(spans), 0.8, key)
+
+    def test_x_has_two_diagonals(self) -> None:
+        """«Х» — ровно два штриха, а не три с зигзагом в месте пересечения."""
+        for key in ("A", "B"):
+            glyph = get_font(key).glyph("Х")
+            assert glyph is not None
+            self.assertEqual(len(glyph.strokes), 2, key)
+
+    def test_m_apex_has_no_gap(self) -> None:
+        """Диагонали «М» сходятся в вершине, а не обрываются с зазором."""
+        for key in ("A", "B"):
+            glyph = get_font(key).glyph("М")
+            assert glyph is not None
+            self.assertTrue(
+                _strokes_connected(glyph.strokes, 0.02),
+                f"{key}: разрыв между штрихами «М»",
+            )
 
 
 class LayoutTests(unittest.TestCase):
