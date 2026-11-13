@@ -320,7 +320,9 @@ def _ray_intersection(p1, u1, p2, u2):
 
 def _trim_end(path, end: int, amount: float):
     """Укорачивает штрих с указанного конца на amount по длине."""
-    pts = list(path) if end == 1 else list(reversed(path))
+    # Обход всегда идёт от подрезаемого конца внутрь, поэтому для последнего
+    # конца порядок точек обращается, а результат возвращается обратно.
+    pts = list(reversed(path)) if end == 1 else list(path)
     if len(pts) < 2 or amount <= 0.0:
         return list(path)
     total = _length(pts)
@@ -344,7 +346,7 @@ def _trim_end(path, end: int, amount: float):
         break
     if kept is None:
         kept = [pts[-1]]
-    result = kept if end == 1 else list(reversed(kept))
+    result = list(reversed(kept)) if end == 1 else kept
     return result if len(result) >= 2 else list(path)
 
 
@@ -477,7 +479,7 @@ def _snap_ends(paths, d: float):
         if len(path) < 2 or _is_closed(path):
             continue
         for end in (0, 1):
-            point = path[end]
+            point = path[-1] if end else path[0]
             best = None
             for j, other in enumerate(result):
                 if j == i or len(other) < 2:
