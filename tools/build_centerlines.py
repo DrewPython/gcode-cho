@@ -973,9 +973,16 @@ def _to_px(x: float, y: float, left: float, top: float, render: float, margin: i
 
 
 def _report(ttf_path: Path, data: dict, cap_units: float) -> None:
-    """Сравнивает восстановленные осевые линии с исходным глифом по IoU."""
+    """Сравнивает восстановленные осевые линии с исходным глифом по IoU.
+
+    Эталон строится заливкой самих контуров по правилу чётности, без
+    растеризации шрифта, поэтому в сравнение не попадают хинтинг и
+    округление кегля. Штрихи рисуются с круглым торцом — именно так маркер
+    продолжает линию за конец осевой линии, — поэтому корректная осевая
+    линия воспроизводит отпечаток глифа точно.
+    """
     try:
-        from PIL import Image, ImageChops, ImageDraw, ImageFont
+        from PIL import Image, ImageChops, ImageDraw
     except ImportError:
         print("--check требует pillow", file=sys.stderr)
         return
@@ -985,12 +992,9 @@ def _report(ttf_path: Path, data: dict, cap_units: float) -> None:
     glyph_set = ttf.getGlyphSet()
 
     render = float(CHECK_RENDER)
-    scale = render / cap_units
-    size = max(8, int(round(scale * float(ttf["head"].unitsPerEm))))
-    font = ImageFont.truetype(str(ttf_path), size)
-
     width_px = max(1, int(round(data["line_width"] * render)))
     margin = int(round(0.12 * render)) + width_px
+    radius = width_px / 2.0
 
     results = []
     for char, (_advance, strokes) in data["glyphs"].items():
@@ -1014,24 +1018,34 @@ def _report(ttf_path: Path, data: dict, cap_units: float) -> None:
         if right - left <= 0.0 or top - bottom <= 0.0:
             continue
 
-        width = int(round((right - left) * render)) + 2 * margin
-        height = int(round((top - bottom) * render)) + 2 * margin
-
-        reference = Image.new("L", (width, height), 0)
-        ImageDraw.Draw(reference).text(
-            _to_px(0.0, 0.0, left, top, render, margin),
-            char,
-            font=font,
-            fill=255,
-            anchor="ls",
+        size = (
+            int(round((right - left) * render)) + 2 * margin,
+            int(round((top - bottom) * render)) + 2 * margin,
         )
 
-        mine = Image.new("L", (width, height), 0)
+        reference = Image.new("1", size, 0)
+        for contour in source:
+            layer = Image.new("1", size, 0)
+            ImageDraw.Draw(layer).polygon(
+                [
+                    _to_px(x / cap_units, y / cap_units, left, top, render, margin)
+                    for x, y in contour
+                ],
+                fill=1,
+            )
+            reference = ImageChops.logical_xor(reference, layer)
+        reference = reference.convert("L")
+
+        mine = Image.new("L", size, 0)
         draw = ImageDraw.Draw(mine)
         for stroke in strokes:
             pts = [_to_px(x, y, left, top, render, margin) for x, y in stroke]
             if len(pts) >= 2:
                 draw.line(pts, fill=255, width=width_px, joint="curve")
+            for px, py in (pts[0], pts[-1]):
+                draw.ellipse(
+                    [px - radius, py - radius, px + radius, py + radius], fill=255
+                )
 
         inter = sum(ImageChops.darker(reference, mine).histogram()[1:])
         union = sum(ImageChops.lighter(reference, mine).histogram()[1:])
