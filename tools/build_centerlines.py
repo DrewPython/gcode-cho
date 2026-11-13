@@ -4,7 +4,7 @@
 без растеризации и без скелетизации. Штрих в этих шрифтах имеет постоянную
 толщину d и является офсетом осевой линии на d/2, поэтому середина пары
 противоположных точек контура всегда лежит на осевой линии. Такой подход
-даёт точные вершины (митры), точные концы и не порождает «шипов» и
+dаёт точные вершины (митры), точные концы и не порождает «шипов» и
 зигзагов в углах и пересечениях, которые появлялись при скелетизации
 растрового отпечатка.
 
@@ -678,35 +678,34 @@ def _extract_midpoints(contours, d: float):
             continue
         ci, i = owner[index]
 
-        best = -1
+        best = None
         best_err = tol
         for sign in (1.0, -1.0):
-            idx = grid.nearest(px + sign * d * nx, py + sign * d * ny, tol)
-            if idx < 0:
+            center = (px + sign * d * nx, py + sign * d * ny)
+            candidates = grid.query(center[0], center[1], tol)
+            if not candidates:
                 continue
-            oc, oi = owner[idx]
-            if oc == ci and abs(oi - i) <= 3:
-                continue
-            qx, qy = flat[idx]
-            span = math.dist((px, py), (qx, qy))
-            if span <= 1e-9:
-                continue
-            # Пара противоположна только тогда, когда отрезок между точками
-            # идёт вдоль нормали контура в обеих точках. Иначе у углов и в
-            # местах пересечения в пару попадает точка соседнего участка
-            # контура: её середина ложная, и из таких середин собираются
-            # кольца и выбросы в стыках.
-            ux, uy = (qx - px) / span, (qy - py) / span
-            if abs(ux * nx + uy * ny) < aligned:
-                continue
-            ox, oy = normals[idx]
-            if abs(ux * ox + uy * oy) < aligned:
-                continue
-            err = abs(span - d)
-            if err < best_err:
-                best_err = err
-                best = idx
-        if best < 0:
+            for idx in candidates:
+                if idx == index:
+                    continue
+                oc, oi = owner[idx]
+                if oc == ci and abs(oi - i) <= 3:
+                    continue
+                qx, qy = flat[idx]
+                span = math.dist((px, py), (qx, qy))
+                if span <= 1e-9:
+                    continue
+                ux, uy = (qx - px) / span, (qy - py) / span
+                if abs(ux * nx + uy * ny) < aligned:
+                    continue
+                ox, oy = normals[idx]
+                if abs(ux * ox + uy * oy) < aligned:
+                    continue
+                err = abs(span - d)
+                if best is None or err < best_err:
+                    best_err = err
+                    best = idx
+        if best is None:
             continue
 
         qx, qy = flat[best]
@@ -715,7 +714,7 @@ def _extract_midpoints(contours, d: float):
         # Вдоль осевой линии толщина постоянна, поэтому рядом не должно
         # быть других участков контура ближе половины толщины. Так
         # отсекаются ложные середины у торцов, углов и пересечений.
-        if grid.nearest(mx, my, inner) >= 0:
+        if grid.query(mx, my, inner):
             continue
 
         midpoints.append(((ci, i), (mx, my)))
