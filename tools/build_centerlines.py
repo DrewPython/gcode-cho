@@ -213,6 +213,21 @@ class _Grid:
                         best = index
         return best
 
+    def query(self, x: float, y: float, radius: float) -> list[int]:
+        """Все индексы точек, попавших в радиус."""
+        reach = max(1, int(math.ceil(radius / self.cell)))
+        cx = int(math.floor(x / self.cell))
+        cy = int(math.floor(y / self.cell))
+        limit2 = radius * radius
+        found: list[int] = []
+        for gx in range(cx - reach, cx + reach + 1):
+            for gy in range(cy - reach, cy + reach + 1):
+                for index in self.buckets.get((gx, gy), ()):
+                    px, py = self.points[index]
+                    if (px - x) ** 2 + (py - y) ** 2 <= limit2:
+                        found.append(index)
+        return found
+
 
 # ---------------------------------------------------------------------------
 # Геометрические помощники
@@ -794,41 +809,59 @@ def _round(value: float) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _horizontal_gap(contours, start) -> float | None:
-    """Расстояние по горизонтали от точки до ближайшего пересечения контура."""
-    x0, y0 = start
-    best = None
+def _opposite_distance(contours, cap_units: float) -> float | None:
+    """Наиболее частое расстояние между противоположными участками контура.
+
+    У штриха постоянной толщины это расстояние равно d, поэтому мода
+    распределения даёт толщину штриха и не зависит от того, как именно
+    нарисован конкретный глиф. Замер «по левой стойке» для этого не годится:
+    у разных гарнитур левый край образован разными элементами.
+    """
+    step = 0.04 * cap_units
+    sampled = []
     for contour in contours:
-        n = len(contour)
-        for i in range(n):
-            ax, ay = contour[i]
-            bx, by = contour[(i + 1) % n]
-            if (ay > 1e-9 and by > 1e-9) or (ay < -1e-9 and by < -1e-9):
-                continue
-            dy = by - ay
-            if abs(dy) < 1e-12:
-                continue
-            t = (y0 - ay) / dy
-            if t < -1e-9 or t > 1.0 + 1e-9:
-                continue
-            x = ax + (bx - ax) * t
-            if x > x0 + 1e-9 and (best is None or x < best):
-                best = x
-    return None if best is None else best - x0
-
-
-def _stem_width(contours, cap_units: float) -> float | None:
-    """Толщина вертикального штриха, измеренная у левого края глифа."""
-    points = [p for contour in contours for p in contour]
-    if not points:
+        points = _resample_closed(contour, step)
+        if len(points) >= 8:
+            sampled.append(points)
+    if not sampled:
         return None
-    x_min = min(p[0] for p in points)
-    edge = sorted(
-        (p for p in points if p[0] <= x_min + 0.04 * cap_units), key=lambda p: p[1]
-    )
-    if not edge:
+
+    flat: list[tuple[float, float]] = []
+    owner: list[tuple[int, int]] = []
+    for ci, points in enumerate(sampled):
+        for i, point in enumerate(points):
+            flat.append(point)
+            owner.append((ci, i))
+
+    grid = _Grid(flat, cell=0.25 * cap_units)
+    radius = 0.35 * cap_units
+    values: list[float] = []
+    for ci, points in enumerate(sampled):
+        n = len(points)
+        guard = max(4, int(n * 0.05))
+        for i, point in enumerate(points):
+            best = None
+            for idx in grid.query(point[0], point[1], radius):
+                oc, oi = owner[idx]
+                if oc == ci:
+                    gap = abs(oi - i)
+                    if min(gap, n - gap) < guard:
+                        continue
+                dist = math.dist(point, flat[idx])
+                if dist > 1e-9 and (best is None or dist < best):
+                    best = dist
+            if best is not None:
+                values.append(best)
+    if not values:
         return None
-    return _horizontal_gap(contours, edge[len(edge) // 2])
+
+    width = 0.002 * cap_units
+    bins: dict[int, list[float]] = {}
+    for value in values:
+        bins.setdefault(int(value / width), []).append(value)
+    peak = max(bins, key=lambda key: len(bins[key]))
+    cluster = sorted(bins[peak])
+    return cluster[len(cluster) // 2]
 
 
 def detect_cap_units(glyph_set, cmap) -> float:
@@ -853,14 +886,14 @@ def detect_cap_units(glyph_set, cmap) -> float:
 def detect_stroke_units(glyph_set, cmap, cap_units: float) -> float:
     """Толщина штриха d в единицах шрифта."""
     samples = []
-    for char in ("Н", "H", "П", "Ш", "И", "N"):
+    for char in ("Н", "H", "П", "Ш", "И", "N", "Б", "В", "О", "о"):
         name = cmap.get(ord(char))
         if not name:
             continue
-        contours = glyph_contours(glyph_set, name, target=0.1 * cap_units)
+        contours = glyph_contours(glyph_set, name, target=0.05 * cap_units)
         if not contours:
             continue
-        value = _stem_width(contours, cap_units)
+        value = _opposite_distance(contours, cap_units)
         if value is not None and 0.02 * cap_units < value < 0.2 * cap_units:
             samples.append(value)
     if not samples:
@@ -934,6 +967,11 @@ def render_font(ttf_path: Path, key: str, check: bool = False) -> dict:
     return data
 
 
+def _to_px(x: float, y: float, left: float, top: float, render: float, margin: int):
+    """Перевод координат глифа (высота прописных = 1) в пиксели канвы."""
+    return (margin + (x - left) * render, margin + (top - y) * render)
+
+
 def _report(ttf_path: Path, data: dict, cap_units: float) -> None:
     """Сравнивает восстановленные осевые линии с исходным глифом по IoU."""
     try:
@@ -942,29 +980,56 @@ def _report(ttf_path: Path, data: dict, cap_units: float) -> None:
         print("--check требует pillow", file=sys.stderr)
         return
 
+    ttf = TTFont(str(ttf_path))
+    cmap = ttf.getBestCmap()
+    glyph_set = ttf.getGlyphSet()
+
     render = float(CHECK_RENDER)
-    upem = float(TTFont(str(ttf_path))["head"].unitsPerEm)
     scale = render / cap_units
-    size = max(8, int(round(scale * upem)))
+    size = max(8, int(round(scale * float(ttf["head"].unitsPerEm))))
     font = ImageFont.truetype(str(ttf_path), size)
 
     width_px = max(1, int(round(data["line_width"] * render)))
     margin = int(round(0.12 * render)) + width_px
-    baseline = margin + data["ascent"] * render
-    height = int(round((data["ascent"] - data["descent"]) * render)) + 2 * margin
 
     results = []
-    for char, (advance, strokes) in data["glyphs"].items():
-        width = int(round(advance * render)) + 2 * margin
+    for char, (_advance, strokes) in data["glyphs"].items():
+        name = cmap.get(ord(char))
+        if not name:
+            continue
+        source = glyph_contours(glyph_set, name, target=0.05 * cap_units)
+        if not source:
+            continue
+
+        # Канва и преобразование координат строятся по фактическому отпечатку
+        # глифа: hhea.ascent/descent в этих шрифтах недостоверны, и при опоре
+        # на них эталон мог оказаться целиком за пределами изображения.
+        x0, y0, x1, y1 = _bbox(source)
+        mine_x = [x for stroke in strokes for x, _y in stroke]
+        mine_y = [y for stroke in strokes for _x, y in stroke]
+        left = min(x0 / cap_units, min(mine_x))
+        right = max(x1 / cap_units, max(mine_x))
+        bottom = min(y0 / cap_units, min(mine_y))
+        top = max(y1 / cap_units, max(mine_y))
+        if right - left <= 0.0 or top - bottom <= 0.0:
+            continue
+
+        width = int(round((right - left) * render)) + 2 * margin
+        height = int(round((top - bottom) * render)) + 2 * margin
+
         reference = Image.new("L", (width, height), 0)
         ImageDraw.Draw(reference).text(
-            (margin, baseline), char, font=font, fill=255, anchor="ls"
+            _to_px(0.0, 0.0, left, top, render, margin),
+            char,
+            font=font,
+            fill=255,
+            anchor="ls",
         )
 
         mine = Image.new("L", (width, height), 0)
         draw = ImageDraw.Draw(mine)
         for stroke in strokes:
-            pts = [(margin + x * render, baseline - y * render) for x, y in stroke]
+            pts = [_to_px(x, y, left, top, render, margin) for x, y in stroke]
             if len(pts) >= 2:
                 draw.line(pts, fill=255, width=width_px, joint="curve")
 
@@ -975,7 +1040,7 @@ def _report(ttf_path: Path, data: dict, cap_units: float) -> None:
     if not results:
         return
     results.sort()
-    mean = sum(iou for iou, _ in results) / len(results) if results else 1.0
+    mean = sum(iou for iou, _ in results) / len(results)
     bad = [(char, iou) for iou, char in results if iou < CHECK_IOU]
     print(f"  IoU: среднее {mean:.4f}, минимум {results[0][0]:.4f} ({results[0][1]!r})")
     if bad:
