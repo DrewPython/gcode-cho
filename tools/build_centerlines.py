@@ -35,6 +35,7 @@ DEFAULT_OUTPUT = ROOT / "gost_marker" / "fonts" / "centerlines.py"
 # высоты прописных, поэтому не зависят от кегля и конкретного шрифта.
 SAMPLE_STEP = 0.10     # шаг дискретизации контура, в долях d
 PARTNER_TOL = 0.25     # допуск поиска партнёра на противоположной стороне
+NORMAL_DEG = 25.0      # допустимое отклонение пары от нормали контура
 WIDTH_TOL = 0.40       # извлечение обрывается за 0.10·d до края «туши»
 DOT_BBOX = 1.70        # контур меньше этого размера считается точкой
 # Вершина восстанавливается как пересечение продолжений соседних штрихов,
@@ -635,54 +636,71 @@ def _extract_midpoints(contours, d: float):
 
     flat: list[tuple[float, float]] = []
     owner: list[tuple[int, int]] = []
+    normals: list[tuple[float, float]] = []
     for ci, points in enumerate(sampled):
+        n = len(points)
         for i, point in enumerate(points):
+            ax, ay = points[(i - 1) % n]
+            bx, by = points[(i + 1) % n]
+            tx, ty = bx - ax, by - ay
+            norm = math.hypot(tx, ty)
+            normals.append((-ty / norm, tx / norm) if norm > 1e-12 else (0.0, 0.0))
             flat.append(point)
             owner.append((ci, i))
 
     grid = _Grid(flat, cell=0.5 * d)
     tol = PARTNER_TOL * d
     inner = 0.5 * d - WIDTH_TOL * d
+    aligned = math.cos(math.radians(NORMAL_DEG))
 
     midpoints = []
-    for ci, points in enumerate(sampled):
-        n = len(points)
-        for i in range(n):
-            px, py = points[i]
-            ax, ay = points[(i - 1) % n]
-            bx, by = points[(i + 1) % n]
-            tx, ty = bx - ax, by - ay
-            norm = math.hypot(tx, ty)
-            if norm <= 1e-12:
+    for index, (px, py) in enumerate(flat):
+        nx, ny = normals[index]
+        if nx == 0.0 and ny == 0.0:
+            continue
+        ci, i = owner[index]
+
+        best = -1
+        best_err = tol
+        for sign in (1.0, -1.0):
+            idx = grid.nearest(px + sign * d * nx, py + sign * d * ny, tol)
+            if idx < 0:
                 continue
-            nx, ny = -ty / norm, tx / norm
-
-            best = -1
-            best_err = tol
-            for sign in (1.0, -1.0):
-                idx = grid.nearest(px + sign * d * nx, py + sign * d * ny, tol)
-                if idx < 0:
-                    continue
-                oc, oi = owner[idx]
-                if oc == ci and abs(oi - i) <= 3:
-                    continue
-                err = abs(math.dist((px, py), flat[idx]) - d)
-                if err < best_err:
-                    best_err = err
-                    best = idx
-            if best < 0:
+            oc, oi = owner[idx]
+            if oc == ci and abs(oi - i) <= 3:
                 continue
-
-            qx, qy = flat[best]
-            mx, my = (px + qx) / 2.0, (py + qy) / 2.0
-
-            # Вдоль осевой линии толщина постоянна, поэтому рядом не должно
-            # быть других участков контура ближе половины толщины. Так
-            # отсекаются ложные середины у торцов, углов и пересечений.
-            if grid.nearest(mx, my, inner) >= 0:
+            qx, qy = flat[idx]
+            span = math.dist((px, py), (qx, qy))
+            if span <= 1e-9:
                 continue
+            # Пара противоположна только тогда, когда отрезок между точками
+            # идёт вдоль нормали контура в обеих точках. Иначе у углов и в
+            # местах пересечения в пару попадает точка соседнего участка
+            # контура: её середина ложная, и из таких середин собираются
+            # кольца и выбросы в стыках.
+            ux, uy = (qx - px) / span, (qy - py) / span
+            if abs(ux * nx + uy * ny) < aligned:
+                continue
+            ox, oy = normals[idx]
+            if abs(ux * ox + uy * oy) < aligned:
+                continue
+            err = abs(span - d)
+            if err < best_err:
+                best_err = err
+                best = idx
+        if best < 0:
+            continue
 
-            midpoints.append(((ci, i), (mx, my)))
+        qx, qy = flat[best]
+        mx, my = (px + qx) / 2.0, (py + qy) / 2.0
+
+        # Вдоль осевой линии толщина постоянна, поэтому рядом не должно
+        # быть других участков контура ближе половины толщины. Так
+        # отсекаются ложные середины у торцов, углов и пересечений.
+        if grid.nearest(mx, my, inner) >= 0:
+            continue
+
+        midpoints.append(((ci, i), (mx, my)))
     return midpoints, [len(points) for points in sampled]
 
 
@@ -717,45 +735,89 @@ def _build_graph(midpoints, sampled_count, d: float):
     return nodes, adj
 
 
-def _edge_key(a: int, b: int) -> tuple[int, int]:
-    return (a, b) if a <= b else (b, a)
-
-
 def _trace(nodes, adj):
-    """Обходит граф узлов, собирая цепочки (штрихи) и замкнутые контуры."""
-    used: set[tuple[int, int]] = set()
+    """Обходит граф узлов, собирая цепочки (штрихи) и замкнутые контуры.
+
+    В узле степени больше двух штрихи продолжаются насквозь: рёбра
+    разбиваются на пары по наименьшему углу поворота. Иначе обход
+    поворачивал в пересечении произвольно — «Х» распадалась на два «V»,
+    а стойки «Н» приклеивались к перекладине.
+    """
+    edges: list[tuple[int, int]] = []
+    for a in range(len(adj)):
+        for b in adj[a]:
+            if a < b:
+                edges.append((a, b))
+    if not edges:
+        return []
+
+    incident: dict[int, list[int]] = {}
+    for index, (a, b) in enumerate(edges):
+        incident.setdefault(a, []).append(index)
+        incident.setdefault(b, []).append(index)
+
+    def direction(node: int, edge: int) -> tuple[float, float] | None:
+        other = edges[edge][1] if edges[edge][0] == node else edges[edge][0]
+        dx = nodes[other][0] - nodes[node][0]
+        dy = nodes[other][1] - nodes[node][1]
+        norm = math.hypot(dx, dy)
+        return None if norm <= 1e-12 else (dx / norm, dy / norm)
+
+    # Сквозной штрих в узле — это пара рёбер с наиболее тупым углом между
+    # направлениями наружу: они смотрят в противоположные стороны.
+    partner: dict[tuple[int, int], int | None] = {}
+    for node, items in incident.items():
+        pool = list(items)
+        while len(pool) >= 2:
+            best = None
+            for i in range(len(pool)):
+                di = direction(node, pool[i])
+                if di is None:
+                    continue
+                for j in range(i + 1, len(pool)):
+                    dj = direction(node, pool[j])
+                    if dj is None:
+                        continue
+                    dot = di[0] * dj[0] + di[1] * dj[1]
+                    if best is None or dot < best[0]:
+                        best = (dot, i, j)
+            if best is None:
+                break
+            _dot, i, j = best
+            partner[(node, pool[i])] = pool[j]
+            partner[(node, pool[j])] = pool[i]
+            pool = [edge for k, edge in enumerate(pool) if k != i and k != j]
+        for edge in pool:
+            partner[(node, edge)] = None
+
+    used: set[int] = set()
     paths: list[list[int]] = []
 
-    starts = [i for i in range(len(adj)) if len(adj[i]) <= 1]
-    starts += [i for i in range(len(adj)) if len(adj[i]) > 1]
-    for start in starts:
-        if all(_edge_key(start, t) in used for t in adj[start]):
-            continue
-        chain = [start]
-        prev = None
-        cur = start
+    def walk(node: int, edge: int) -> list[int]:
+        chain = [node]
         while True:
-            nxt = None
-            for t in adj[cur]:
-                if t == prev or _edge_key(cur, t) in used:
-                    continue
-                nxt = t
+            used.add(edge)
+            a, b = edges[edge]
+            node = b if a == node else a
+            chain.append(node)
+            nxt = partner.get((node, edge))
+            if nxt is None or nxt in used:
                 break
-            if nxt is None:
-                if (
-                    len(chain) > 2
-                    and chain[0] in adj[chain[-1]]
-                    and _edge_key(chain[-1], chain[0]) not in used
-                ):
-                    used.add(_edge_key(chain[-1], chain[0]))
-                    chain.append(chain[0])
-                break
-            used.add(_edge_key(cur, nxt))
-            chain.append(nxt)
-            prev, cur = cur, nxt
-        if len(chain) >= 2:
-            paths.append([nodes[i] for i in chain])
-    return paths
+            edge = nxt
+        return chain
+
+    # Сначала цепочки, начинающиеся в узле, где штрих обрывается, затем
+    # оставшиеся кольца.
+    for node, items in incident.items():
+        for edge in items:
+            if edge in used or partner.get((node, edge)) is not None:
+                continue
+            paths.append(walk(node, edge))
+    for index in range(len(edges)):
+        if index not in used:
+            paths.append(walk(edges[index][0], index))
+
+    return [[nodes[i] for i in chain] for chain in paths if len(chain) >= 2]
 
 
 def extract_strokes(contours, d: float, cap_units: float):
