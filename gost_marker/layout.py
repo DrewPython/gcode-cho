@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
@@ -9,6 +10,12 @@ from .fonts.gost import StrokeFont, get_font
 from .fonts.primitives import Point, Stroke, clean_stroke
 
 BBox = tuple[float, float, float, float]  # xmin, ymin, xmax, ymax
+
+# Максимальный разрыв между концами штрихов одного глифа, который считается
+# стыком и склеивается в один проход. Меньше одной толщины штриха: так «N»
+# собирается в один штрих, а точка над «i» или breve «Й» не приклеиваются
+# к букве.
+CHAIN_TOL_STROKE = 1.1
 
 
 def normalize_text(text: str) -> str:
@@ -134,6 +141,66 @@ def wrap_text(
     return result
 
 
+def _distance(a: Point, b: Point) -> float:
+    return math.hypot(b[0] - a[0], b[1] - a[1])
+
+
+def chain_strokes(paths: Sequence[Sequence[Point]], tolerance: float) -> list[Stroke]:
+    """Склеивает штрихи глифа в один проход, если их концы почти совпадают.
+
+    В отличие от простого «конец предыдущего = начало следующего», здесь
+    можно менять направление штрихов и склеивать любой конец с любым.
+    Например, у «N» диагональ не дотягивается до верха стойки на доли
+    толщины; короткий соединитель идёт по стойке, и буква пишется одним
+    проходом без подъёма маркера.
+    """
+    chains: list[Stroke] = [
+        [(float(x), float(y)) for x, y in path] for path in paths if len(path) >= 2
+    ]
+    if len(chains) < 2:
+        return chains
+
+    while True:
+        best = None
+        for i in range(len(chains)):
+            for j in range(i + 1, len(chains)):
+                for end_i in (0, 1):
+                    for end_j in (0, 1):
+                        pi = chains[i][0] if end_i == 0 else chains[i][-1]
+                        pj = chains[j][0] if end_j == 0 else chains[j][-1]
+                        distance = _distance(pi, pj)
+                        if distance <= tolerance and (
+                            best is None or distance < best[0]
+                        ):
+                            best = (distance, i, end_i, j, end_j)
+        if best is None:
+            break
+
+        _distance_best, i, end_i, j, end_j = best
+        first = chains[i]
+        second = chains[j]
+        if end_i == 0:
+            first = first[::-1]
+        if end_j == 1:
+            second = second[::-1]
+
+        # Если концы совпадают, точку стыка не дублируем. Если между ними
+        # осталась щель — она станет коротким соединителем с опущенным пером.
+        overlap = _distance(first[-1], second[0]) <= 1e-9
+        chains[i] = first + (second[1:] if overlap else second)
+        chains.pop(j)
+
+    out: list[Stroke] = []
+    for chain in chains:
+        clean: Stroke = []
+        for point in chain:
+            if not clean or _distance(clean[-1], point) > 1e-9:
+                clean.append(point)
+        if len(clean) >= 2:
+            out.append(clean)
+    return out
+
+
 @dataclass
 class LayoutResult:
     paths: list[Stroke] = field(default_factory=list)
@@ -236,6 +303,7 @@ def layout_text(
                 result.missing.add(ch)
                 cursor += 0.5 * size_mm
                 continue
+            glyph_paths: list[Stroke] = []
             for stroke in glyph.strokes:
                 pts: Stroke = []
                 for gx, gy in stroke:
@@ -247,7 +315,9 @@ def layout_text(
                     )
                 pts = clean_stroke(pts)
                 if len(pts) >= 2:
-                    result.paths.append(pts)
+                    glyph_paths.append(pts)
+            chain_tol = max(0.02, CHAIN_TOL_STROKE * font.line_width * size_mm)
+            result.paths.extend(chain_strokes(glyph_paths, chain_tol))
             cursor += glyph.width * font.x_scale * size_mm + ls
         # после последнего символа межбуквенный интервал не нужен,
         # но на ширину строки он уже не влияет

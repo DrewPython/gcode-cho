@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 import tempfile
 import threading
@@ -74,6 +75,39 @@ class FontTests(unittest.TestCase):
             ]
             self.assertGreater(max(spans), 0.8, key)
 
+    def test_complex_junctions_are_clean(self) -> None:
+        """В сложных стыках не должно быть палок и десятка обрывков."""
+        for key in ("A", "B"):
+            font = get_font(key)
+            self.assertLessEqual(len(font.glyph("Ж").strokes), 4, key)
+            self.assertLessEqual(len(font.glyph("К").strokes), 4, key)
+            self.assertLessEqual(len(font.glyph("М").strokes), 3, key)
+            self.assertLessEqual(len(font.glyph("8").strokes), 2, key)
+            self.assertEqual(len(font.glyph("О").strokes), 1, key)
+
+    def test_junction_glyphs_have_no_short_spurs(self) -> None:
+        """Короткие усики в стыках — это артефакт, а не штрих."""
+        for key in ("A", "B"):
+            font = get_font(key)
+            for char in "ЖКФ8МЕАУЯж":
+                glyph = font.glyph(char)
+                self.assertIsNotNone(glyph, f"{key}: {char}")
+                for stroke in glyph.strokes:
+                    length = sum(
+                        math.dist(stroke[i], stroke[i + 1])
+                        for i in range(len(stroke) - 1)
+                    )
+                    self.assertGreater(length, 0.08, f"{key}: {char}")
+
+    def test_round_glyphs_are_closed(self) -> None:
+        for key in ("A", "B"):
+            font = get_font(key)
+            for char in "О8":
+                glyph = font.glyph(char)
+                self.assertEqual(len(glyph.strokes), 1, f"{key}: {char}")
+                stroke = glyph.strokes[0]
+                self.assertLess(math.dist(stroke[0], stroke[-1]), 0.01, f"{key}: {char}")
+
 
 class LayoutTests(unittest.TestCase):
     def test_multiline_layout(self) -> None:
@@ -88,7 +122,7 @@ class LayoutTests(unittest.TestCase):
                 valign="middle",
             )
             self.assertEqual(layout.line_count, 2)
-            self.assertGreater(layout.stroke_count, 10)
+            self.assertGreater(layout.stroke_count, 5)
             self.assertFalse(layout.missing)
             self.assertIsNotNone(layout.bbox)
             width, height = bbox_size(layout.bbox)
@@ -134,6 +168,33 @@ class LayoutTests(unittest.TestCase):
             max_width_mm=30.0,
         )
         self.assertGreater(layout.line_count, 1)
+
+    def test_n_is_one_continuous_stroke(self) -> None:
+        """«N» должна писаться одним проходом, без двух подъёмов пера."""
+        for key in ("A", "B"):
+            layout = layout_text("N", font=key, size_mm=6.3, x_mm=0.0, y_mm=0.0)
+            self.assertEqual(len(layout.paths), 1, key)
+            start = layout.paths[0][0]
+            end = layout.paths[0][-1]
+            # Концы должны быть на противоположных вертикалях: низ слева,
+            # верх справа (или наоборот после разворота).
+            self.assertGreater(abs(start[1] - end[1]), 0.8 * 6.3, key)
+
+    def test_diacritics_are_not_glued_to_letter(self) -> None:
+        """Короткий соединитель не должен приклеивать breve/точку к букве."""
+        for key in ("A", "B"):
+            breve = layout_text("Й", font=key, size_mm=6.3, x_mm=0.0, y_mm=0.0)
+            self.assertEqual(len(breve.paths), 2, key)
+            i_dot = layout_text("i", font=key, size_mm=6.3, x_mm=0.0, y_mm=0.0)
+            self.assertEqual(len(i_dot.paths), 2, key)
+
+    def test_gcode_n_has_single_pen_down(self) -> None:
+        layout = layout_text("N", font="A", size_mm=6.3, x_mm=0.0, y_mm=0.0)
+        job = generate_gcode(layout.paths, MachineConfig(), size_mm=6.3)
+        self.assertEqual(job.stats.stroke_count, 1)
+        self.assertEqual(job.text.count("G1 Z0"), 1)
+        # начальный подъём, подъём после единственного штриха и финальный
+        self.assertEqual(job.text.count("G0 Z5"), 3)
 
 
 class GcodeTests(unittest.TestCase):
